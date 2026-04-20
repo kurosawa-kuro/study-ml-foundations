@@ -1,0 +1,154 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+MLOps教育用のカリフォルニア住宅価格予測パイプライン。LightGBM + Docker Compose でローカル完結する構成（Phase 1）。
+
+## Architecture
+
+```
+PostgreSQL (docker-compose: postgres サービス / volume: postgres_data)
+  → ml/pipeline: Repository パターンでデータ取得
+    → ml/pipeline: 前処理 (欠損値補完・外れ値キャップ・対数変換)
+      → ml/pipeline: 特徴量エンジニアリング (BedroomRatio・RoomsPerPerson)
+        → ml/trainer: LightGBM 学習
+          → ml/evaluation: 精度評価 (RMSE, R²) + W&B ログ
+            → models/{run_id}/ に保存 + PostgreSQL に精度記録 + latest シンボリックリンク更新
+              → api: FastAPI lifespan でモデルロード → 前処理 → 特徴量生成 → 推論
+```
+
+**Key design decisions:**
+- **Docker 前提** — seed / train / serve は全て `docker compose` 経由で実行。DB も同じ network 上の `postgres` サービスを使用
+- **パッケージ間の責務分離**: ml/pipeline(データ+オーケストレーション) / ml/trainer(学習) / ml/evaluation(評価+W&B) / api(推論) / share(共通)
+- **Repository pattern** — `PostgresRepository` (SQLAlchemy + psycopg)、`DATA_SOURCE` env var で切り替え
+- **No scikit-learn for metrics** — RMSE, R² は numpy で自前実装 (`ml/evaluation/metrics.py`)
+- **W&B はオプション** — API キーなしで offline モード動作。精度評価・モデル保存に影響なし
+- **Run ID** — `YYYYMMDD_HHMMSS_{6桁UUID}` でモデルにバージョン付与。`models/latest` シンボリックリンクで最新を参照
+- **構造化ロギング** — `share/logging.py` の `get_logger()` で統一。全モジュール `logger.info()` を使用
+- **API DI 化** — FastAPI lifespan で `app.state.booster` にモデルをロード。グローバル状態なし
+- **エラーハンドリング** — pipeline/main.py でデータ取得・学習・W&B の各ステップを try-except で保護
+- **Makefile → scripts/ に委譲** — `scripts/core.sh` に共通設定を集約
+
+## Source Layout
+
+```
+src/
+├── ml/              ML コア
+│   ├── pipeline/        データパイプライン + オーケストレーション
+│   │   ├── main.py          学習エントリーポイント (python3 -m ml.pipeline.main)
+│   │   ├── config.py         Settings (data_source, postgres_*, model_dir)
+│   │   ├── repository.py     PostgresRepository (fetch_train / fetch_test / save_run / fetch_runs)
+│   │   ├── preprocess.py     前処理 (欠損値補完・外れ値キャップ・対数変換)
+│   │   ├── feature_engineering.py  特徴量エンジニアリング (BedroomRatio・RoomsPerPerson)
+│   │   └── seed.py           sklearn → PostgreSQL データ投入
+│   ├── trainer/         学習アルゴリズム
+│   │   └── train.py         LightGBM 学習・モデル保存
+│   └── evaluation/      評価・実験ログ
+│       ├── config.py         EvalSettings (wandb_api_key, wandb_project)
+│       ├── metrics.py        rmse, r2_score, evaluate, save_metrics
+│       └── tracking.py       W&B 初期化・ログ送信
+├── api/             推論API
+│   ├── main.py           FastAPI lifespan + Jinja2 (GET / POST /predict GET /health)
+│   ├── config.py         Settings (model_path)
+│   └── templates/        Jinja2 フロントエンド
+└── share/           共通
+    ├── config.py         BaseAppSettings (env_file=".env")
+    ├── logging.py        get_logger() — 構造化ロギング
+    ├── schema.py         FEATURE_COLS, ENGINEERED_COLS, MODEL_COLS, TARGET_COL
+    └── run_id.py         generate_run_id()
+```
+
+## Commands
+
+```bash
+make build          # Docker イメージビルド
+make seed           # sklearn データを PostgreSQL に投入 (Docker)
+make train          # LightGBM 学習 → models/{run_id}/ に保存 (Docker)
+make serve          # FastAPI 起動 (port 8000, Docker)
+make test           # pytest 全テスト実行 (ローカル)
+make all            # build → seed → train
+make down           # Docker Compose 停止
+make clean          # Docker 停止 + 生成ファイル削除
+
+# 単体テスト指定
+./scripts/test.sh -k test_train
+```
+
+## Scripts
+
+```
+scripts/
+├── core.sh          共通設定 (set -euo pipefail, cd, step関数)
+├── test.sh          pytest (ローカル)
+├── clean.sh         Docker down + ファイル削除
+├── ml/
+│   ├── seed.sh      docker compose run --rm seed (postgres サービス起動込み)
+│   └── train.sh     docker compose run --rm trainer
+└── api/
+    └── serve.sh     docker compose up --build api
+```
+
+## Docker
+
+| サービス | Image / Dockerfile | ポート | 用途 |
+|---|---|---|---|
+| postgres | postgres:16 | 5432 | データ永続化 (volume: `postgres_data`) |
+| seed | Dockerfile.trainer | — | PostgreSQL データ投入 (run して終了) |
+| trainer | Dockerfile.trainer | — | 学習 (seed 完了後に実行) |
+| api | Dockerfile.api | 8000 | FastAPI 推論 + Web UI |
+
+## Configuration
+
+設定は用途別に 2 ファイルへ分離（どちらも YAML で統一）:
+
+| ファイル | 内容 | git 管理 |
+|---|---|---|
+| `env/config/setting.yaml` | 非クレデンシャル（DB ホスト・ポート・DB 名・モデルパス等） | track |
+| `env/secret/credential.yaml` | クレデンシャル（postgres_password, wandb_api_key） | **gitignore** (`env/secret/` ごと) |
+
+`share/config.py::BaseAppSettings` が pydantic-settings の YamlConfigSettingsSource を 2 本積んで両方をロード。優先度: **環境変数 > credential.yaml > setting.yaml > コード既定値**。
+
+**docker-compose 連携**: postgres コンテナ（公式イメージ）は env var で `POSTGRES_PASSWORD` を要求するため、`scripts/core.sh::load_credentials` が起動前に credential.yaml を読み取り `POSTGRES_PASSWORD` / `WANDB_API_KEY` を shell にエクスポートし、compose の `${POSTGRES_PASSWORD}` 補間で注入する。Python 側のコンテナは `./env/secret` を read-only volume でマウントし、BaseAppSettings が直接 YAML を読む。
+
+### setting.yaml の主なキー
+
+| キー | 用途 | 既定値 |
+|---|---|---|
+| `data_source` | データソース種別 | `postgres` |
+| `postgres_host` | PostgreSQL ホスト | `postgres` (compose サービス名) |
+| `postgres_port` | PostgreSQL ポート | `5432` |
+| `postgres_db` | DB 名 | `mlpipeline` |
+| `postgres_user` | DB ユーザー | `admin` |
+| `model_dir` | モデル出力先 | `models` |
+| `model_path` | API が読むモデルパス | `models/latest/model.lgb` |
+| `wandb_project` | W&B プロジェクト名 | `california-housing` |
+
+### credential.yaml の主なキー
+
+| キー | 用途 |
+|---|---|
+| `postgres_password` | PostgreSQL パスワード |
+| `wandb_api_key` | W&B API キー（空なら offline モード） |
+
+## Dependencies
+
+lightgbm, pandas, numpy, scikit-learn (データ取得のみ), wandb, pydantic-settings, fastapi, uvicorn, jinja2, sqlalchemy, psycopg[binary]
+
+テスト用 (ローカル pytest): `testcontainers[postgres]` (一時 PostgreSQL をテスト中に起動)。未インストール時は DB 依存テストが skip される。
+
+## Testing
+
+pytest + `pyproject.toml` で設定。`pythonpath = ["src"]`。
+
+```
+tests/
+├── conftest.py              共通フィクスチャ (sample_df, postgres_url, sample_db)
+├── api/
+│   └── test_api.py          /health, /predict エンドポイント
+└── ml/
+    ├── test_evaluation.py   RMSE, R², save_metrics, W&B offline
+    ├── test_pipeline.py     Settings, PostgresRepository (testcontainers)
+    └── test_trainer.py      LightGBM 学習 + run ID + symlink
+```
